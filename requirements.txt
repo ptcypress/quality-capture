@@ -1,0 +1,14 @@
+# Core
+pandas>=2.0
+pyyaml>=6.0
+
+# Capture app
+pyserial>=3.5
+openpyxl>=3.1
+
+# SPC viewer (Streamlit + Plotly)
+streamlit>=1.37
+plotly>=5.22
+
+# Optional (event-driven folder watching instead of polling)
+# watchdog>=4.0
