@@ -271,6 +271,13 @@ st.download_button(
 )
 
 # ---------------- Auto-refresh ----------------
-# If refresh_s > 0, rerun periodically; the cache busts automatically when mtime changes.
+# Works on old and new Streamlit versions
 if refresh_s > 0:
-    st.autorefresh(interval=refresh_s * 1000, key="spc-autorefresh")
+    auto = getattr(st, "autorefresh", None)
+    if callable(auto):
+        st.autorefresh(interval=int(refresh_s * 1000), key="spc-autorefresh")
+    else:
+        import time
+        time.sleep(refresh_s)
+        st.experimental_rerun()
+
