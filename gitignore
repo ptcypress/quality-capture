@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local app outputs & local settings
+app_capture/Logs/*
+!app_capture/Logs/.gitkeep
+app_capture/settings.json
+spc_viewer/.streamlit/secrets.toml
+
+# Editors
+.vscode/
+.idea/
