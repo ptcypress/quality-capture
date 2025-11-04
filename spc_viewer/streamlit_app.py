@@ -1,23 +1,17 @@
 # streamlit_app.py
 # -------------------------------------------------------------
-# Interactive SPC viewer for your Auto‑Caliper capture logs.
-# 
-# • Reads the latest CSV in C:\\CaliperCapture\\Logs (or latest per Order ID)
-# • Individuals (I) chart + Moving Range (MR) chart
-# • Sigma estimated from MR(2); WECO Rule 1 highlighting (beyond limits)
-# • Optional filters: profile, reel; adjustable sigma limits, window size
-# • Auto‑refresh by polling file mtime (no GitHub, no database)
-# 
-# How to run (once Python + Streamlit are installed):
-#   pip install streamlit plotly pandas
-#   streamlit run streamlit_app.py
+# Local SPC viewer for Auto-Caliper capture logs
+# - Polls a local folder for newest CSV/XLSX (or newest for a given Order ID)
+# - Individuals (I) chart + Moving Range (MR) chart
+# - Sigma estimated from MR(2); Rule-1 highlighting (beyond limits)
+# - Debug expander shows exactly what files were found/matched
 # -------------------------------------------------------------
 
 import os
 import time
 import glob
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -26,11 +20,19 @@ import streamlit as st
 
 st.set_page_config(page_title="Local SPC Viewer", layout="wide")
 
+# ---------------- Defaults ----------------
+# Prefer repo-relative logs: ../app_capture/Logs
+REPO_LOGS = (Path(__file__).resolve().parents[1] / "app_capture" / "Logs")
+FALLBACK_LOGS = Path(r"C:\CaliperCapture\Logs")
+DEFAULT_LOGS = str(REPO_LOGS if REPO_LOGS.exists() else FALLBACK_LOGS)
+
 # ---------------- Sidebar controls ----------------
 st.sidebar.header("Data Source")
-logs_dir = st.sidebar.text_input("Logs folder", r"C:\\CaliperCapture\\Logs")
+logs_dir = st.sidebar.text_input("Logs folder", DEFAULT_LOGS)
 order_id = st.sidebar.text_input("Order ID (optional)", "").strip().upper()
-pattern = f"{order_id}_*.csv" if order_id else "*.csv"
+
+# Pattern is lenient; we still enforce ORDERID_ prefix later if order_id provided
+pattern = f"{order_id}_*" if order_id else "*"
 pick_latest = st.sidebar.checkbox("Always use most recent file", True)
 refresh_s = st.sidebar.slider("Auto-refresh (seconds)", 0, 60, 10, 1)
 
@@ -41,35 +43,99 @@ sigma_mult = st.sidebar.slider("Sigma limits (±)", 2.0, 4.0, 3.0, 0.5)
 window_pts = st.sidebar.number_input("Show last N points (0 = all)", 0, 50000, 0, 100)
 show_table = st.sidebar.checkbox("Show data table", False)
 
-# ---------------- File discovery helpers ----------------
-def list_csvs(folder: str, patt: str) -> list[str]:
-    files = glob.glob(os.path.join(folder, patt))
-    files = [f for f in files if os.path.isfile(f)]
-    files.sort(key=os.path.getmtime, reverse=True)
-    return files
+# ---------------- File discovery helpers (more forgiving + debug) ----------------
+def list_files_debug(folder: str, patt: str) -> Dict:
+    """
+    Return diagnostic info including:
+      - folder existence
+      - all files in folder
+      - matched candidates (case-insensitive, csv/xlsx only)
+    """
+    import traceback
+    info = {
+        "folder": folder,
+        "pattern": patt,
+        "exists": False,
+        "files_all": [],
+        "files_match": [],
+        "error": None,
+    }
+    try:
+        info["exists"] = os.path.isdir(folder)
+        if info["exists"]:
+            # List all files (non-recursive)
+            all_files = [str(p) for p in Path(folder).glob("*") if Path(p).is_file()]
+            info["files_all"] = sorted(all_files, key=os.path.getmtime, reverse=True)
 
-files = list_csvs(logs_dir, pattern)
+            patt_lower = patt.lower()
+            candidates: List[str] = []
+            for f in all_files:
+                name = os.path.basename(f)
+                name_lower = name.lower()
+                # Loose match: substring or glob
+                if patt_lower.replace("*", "") in name_lower or glob.fnmatch.fnmatch(name_lower, patt_lower):
+                    candidates.append(f)
+
+            # Accept only CSV/XLSX
+            info["files_match"] = [
+                f for f in candidates if os.path.splitext(f)[1].lower() in (".csv", ".xlsx")
+            ]
+        return info
+    except Exception as e:
+        info["error"] = f"{e}\n{traceback.format_exc()}"
+        return info
+
+debug = list_files_debug(logs_dir, pattern)
+
+with st.expander("🔎 Debug: folder scan", expanded=False):
+    st.write(debug)
+
+# Choose files (prefer CSV first, then XLSX)
+files = debug["files_match"] if debug["exists"] else []
+# If user typed an Order ID, strongly filter to ORDERID_* prefix
+if order_id:
+    files = [f for f in files if os.path.basename(f).upper().startswith(order_id + "_")]
+
+# Prefer CSVs first
+files = sorted(files, key=os.path.getmtime, reverse=True)
+files_csv = [f for f in files if f.lower().endswith(".csv")]
+files_xlsx = [f for f in files if f.lower().endswith(".xlsx")]
+files = files_csv + files_xlsx
+
 if not files:
-    st.info("No CSVs found yet. Waiting for data…\n\nFolder: %s\nPattern: %s" % (logs_dir, pattern))
+    st.error(
+        "No matching files found.\n\n"
+        "Tips:\n"
+        "• Clear the Order ID box to see all files\n"
+        "• Make sure the file extension is .csv or .xlsx\n"
+        "• Confirm the path in the debug panel above"
+    )
     st.stop()
 
-file_path = files[0] if pick_latest else st.sidebar.selectbox("Choose file", files, index=0)
-file_path = Path(file_path)
+file_path = Path(files[0]) if pick_latest else Path(st.sidebar.selectbox("Choose file", files, index=0))
 
-# ---------------- Robust CSV loading with cache ----------------
+# ---------------- Robust loader for CSV/XLSX with cache ----------------
 @st.cache_data
-def load_csv_cached(path: str, mtime: float) -> pd.DataFrame:
-    # retry a few times in case another process is writing
+def load_any(path: str, mtime: float) -> pd.DataFrame:
+    """
+    Cache is keyed by file path + mtime. Retries a few times in case another process
+    is writing the file. Supports .csv and .xlsx.
+    """
+    ext = os.path.splitext(path)[1].lower()
     last_err: Optional[Exception] = None
     for _ in range(5):
         try:
-            df = pd.read_csv(path)
-            return df
+            if ext == ".xlsx":
+                return pd.read_excel(path)
+            return pd.read_csv(path)
         except Exception as e:
             last_err = e
             time.sleep(0.2)
     if last_err:
         raise last_err
+    # final attempt without catching
+    if ext == ".xlsx":
+        return pd.read_excel(path)
     return pd.read_csv(path)
 
 try:
@@ -77,29 +143,34 @@ try:
 except Exception:
     mtime = time.time()
 
-df = load_csv_cached(str(file_path), mtime)
+df = load_any(str(file_path), mtime)
 
 # ---------------- Basic hygiene & optional filters ----------------
-# Expected columns from your capture app: timestamp, operator, part_id, order_id, reel, profile, DIM n, DIM n_result …
+# Expected columns: timestamp, operator, part_id, order_id, reel, profile, DIM n, DIM n_result …
 if "timestamp" in df.columns:
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 else:
-    # fabricate an index timestamp if missing
+    # fabricate timestamps if missing
     df["timestamp"] = pd.date_range("2025-01-01", periods=len(df), freq="T")
 
-# Optional quick-filters based on profile/reel text inputs
+# Optional text filters
 if profile_filter:
-    mask = df.get("profile", "").astype(str).str.contains(profile_filter, case=False, na=False)
-    df = df[mask]
+    if "profile" in df.columns:
+        df = df[df["profile"].astype(str).str.contains(profile_filter, case=False, na=False)]
 if reel_filter:
     if "reel" in df.columns:
         df = df[df["reel"].astype(str).str.upper() == reel_filter]
 
-# Choose which numeric series to chart: by default take the first DIM* column that is numeric
-value_cols = [c for c in df.columns if c.startswith("DIM ")]
-num_cols = [c for c in value_cols if pd.api.types.is_numeric_dtype(df[c]) or pd.to_numeric(df[c], errors="coerce").notna().any()]
+# Pick a numeric DIM column by default
+value_cols = [c for c in df.columns if c.upper().startswith("DIM ")]
+num_cols = []
+for c in value_cols:
+    s = pd.to_numeric(df[c], errors="coerce")
+    if s.notna().any():
+        num_cols.append(c)
+
 if not num_cols:
-    # fall back to the last numeric column in the frame
+    # Fall back to any numeric column
     fallback = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     if not fallback:
         st.error("No numeric measurement columns found (e.g., 'DIM 1').")
@@ -179,7 +250,8 @@ fig_mr.add_hline(y=Rbar, line_dash="dash", annotation_text=f"Ȓ {Rbar:.5f}")
 fig_mr.add_hline(y=MR_UCL, line_dash="dot", annotation_text=f"UCL {MR_UCL:.5f}")
 fig_mr.add_hline(y=MR_LCL, line_dash="dot", annotation_text=f"LCL {MR_LCL:.5f}")
 fig_mr.update_layout(
-    title="Moving Range (MR)", xaxis_title="timestamp", yaxis_title="|ΔX|",
+    title="Moving Range (MR)",
+    xaxis_title="timestamp", yaxis_title="|ΔX|",
     height=320, hovermode="x unified", legend_title="Series",
 )
 
@@ -199,6 +271,6 @@ st.download_button(
 )
 
 # ---------------- Auto-refresh ----------------
-# If refresh_s > 0, ping rerun periodically; cache bust happens when mtime changes.
+# If refresh_s > 0, rerun periodically; the cache busts automatically when mtime changes.
 if refresh_s > 0:
     st.autorefresh(interval=refresh_s * 1000, key="spc-autorefresh")
