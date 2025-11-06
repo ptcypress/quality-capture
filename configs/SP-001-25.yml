@@ -1,7 +1,7 @@
 features:
   - { name: DIM 1, lsl: 0.3450, usl: 0.3850, zero_at: 0.2190, zero_mode: radius, nominal: 0.3650, caliper_target: 0.4745 }
   - { name: DIM 2, lsl: 7.3000, usl: 7.3300, zero_at: 0.2190, zero_mode: diameter, nominal: 7.3150, caliper_target: 7.5340 }
-  - { name: DIM 3, lsl: 0.8900, usl: 0.9140, zero_at: 0.2190, zero_mode: radius, nominal: 0.9020, caliper_target: 1.1210 }
+  - { name: DIM 3, lsl: 0.8900, usl: 0.9140, zero_at: 0.2190, zero_mode: diameter, nominal: 0.9020, caliper_target: 1.1210 }
   - { name: DIM 4, lsl: 7.3000, usl: 7.3300, zero_at: 0.2190, zero_mode: diameter, nominal: 7.3150, caliper_target: 7.5340 }
   - { name: DIM 5, lsl: 0.3450, usl: 0.3850, zero_at: 0.2190, zero_mode: radius, nominal: 0.3650, caliper_target: 0.4745 }
   - { name: DIM 6, lsl: 16.2420, usl: 16.2820, zero_at: 0.0000, zero_mode: diameter, nominal: 16.2620, caliper_target: 16.2620 }
