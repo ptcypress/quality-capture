@@ -447,7 +447,7 @@ else:
 if value_mode.startswith("Actual"):
     spec_lines_drawn = False
     for dim in dim_picks:
-        limits = limits_by_dim.get(dim.upper())
+        limits = limits_by_dim.get(_norm_dim_key(dim))
         if limits:
             lsl, usl = limits
             if lsl is not None:
@@ -462,7 +462,7 @@ if value_mode.startswith("Actual"):
         st.caption("Specs: no matching LSL/USL found in YAML for selected DIMs.")
 else:
     st.caption("Specs hidden: switch to **Actual (corrected)** to view USL/LSL.")
-
+    
 fig_i.update_layout(
     title=f"{(infer_part_label(df, file_label) + ' — ') if infer_part_label(df, file_label) else ''}Individuals (I) — {value_mode} — {title_suffix}",
     xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
