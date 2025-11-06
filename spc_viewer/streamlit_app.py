@@ -360,28 +360,82 @@ if source == "Local folder":
     cfg_dir_local = st.sidebar.text_input("Config folder (local)", default_cfg_dir)
 
     @st.cache_data
-    def load_limits_from_yaml_local(cfg_dir: str, part: str):
-        if not yaml or not part:
-            return {}, "no-yaml-or-part"
-        base = Path(cfg_dir)
-        tried = []
-        for ext in (".yml", ".yaml"):
-            p = base / f"{part}{ext}"
-            tried.append(str(p))
-            if p.exists():
-                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-                return _parse_limits_from_yaml_dict(data), f"file:{p.name}"
-        # Fallback: scan folder for profile match
-        yfiles = list(base.glob("*.yml")) + list(base.glob("*.yaml"))
-        for fp in yfiles:
+    @st.cache_data
+def load_limits_from_yaml_local(cfg_dir: str, part: str):
+    """
+    Returns (limits_by_dim, source_note).
+
+    Tries in order:
+      1) {cfg_dir}/{part}              (no extension)
+      2) {cfg_dir}/{part}.yml/.yaml
+      3) {cfg_dir}/{part}/{part}       (no extension)
+      4) {cfg_dir}/{part}/{part}.yml/.yaml
+      5) {cfg_dir}/{part}/config       (no extension)
+      6) {cfg_dir}/{part}/config.yml/.yaml
+      7) Recursive scan for a YAML whose top-level 'profile' == part
+    """
+    if not yaml or not part:
+        return {}, "no-yaml-or-part"
+
+    base = Path(cfg_dir)
+    tried = []
+
+    def _try_file(p: Path, label: str):
+        if p.exists() and p.is_file():
             try:
-                data = yaml.safe_load(fp.read_text(encoding="utf-8")) or {}
-                prof = (data.get("profile") or data.get("PROFILE") or "").strip().upper()
-                if prof == part:
-                    return _parse_limits_from_yaml_dict(data), f"file:{fp.name}(profile-match)"
+                text = p.read_text(encoding="utf-8")
+                data = yaml.safe_load(text) or {}
+                return _parse_limits_from_yaml_dict(data), label
             except Exception:
                 pass
-        return {}, "not-found:" + ";".join(tried)
+        tried.append(str(p))
+        return None
+
+    # 1) {cfg_dir}/{part} (extensionless)
+    r = _try_file(base / part, f"file:{part}(no-ext)")
+    if r: return r
+
+    # 2) {cfg_dir}/{part}.yml/.yaml
+    for ext in (".yml", ".yaml"):
+        r = _try_file(base / f"{part}{ext}", f"file:{part}{ext}")
+        if r: return r
+
+    # 3) {cfg_dir}/{part}/{part} (extensionless)
+    r = _try_file(base / part / part, f"file:{part}/{part}(no-ext)")
+    if r: return r
+
+    # 4) {cfg_dir}/{part}/{part}.yml/.yaml
+    for ext in (".yml", ".yaml"):
+        r = _try_file(base / part / f"{part}{ext}", f"file:{part}/{part}{ext}")
+        if r: return r
+
+    # 5) {cfg_dir}/{part}/config (extensionless)
+    r = _try_file(base / part / "config", f"file:{part}/config(no-ext)")
+    if r: return r
+
+    # 6) {cfg_dir}/{part}/config.yml/.yaml
+    for ext in (".yml", ".yaml"):
+        r = _try_file(base / part / f"config{ext}", f"file:{part}/config{ext}")
+        if r: return r
+
+    # 7) Recursive scan for profile match
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        # Accept extensionless OR .yml/.yaml
+        if p.suffix.lower() not in ("", ".yml", ".yaml"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+            data = yaml.safe_load(text) or {}
+            prof = (data.get("profile") or data.get("PROFILE") or "").strip().upper()
+            if prof == part:
+                return _parse_limits_from_yaml_dict(data), f"file:{p.as_posix()}(profile-match)"
+        except Exception:
+            continue
+
+    return {}, "not-found:" + ";".join(tried)
+
 
     limits_by_dim, spec_src = load_limits_from_yaml_local(cfg_dir_local, part_name)
 
