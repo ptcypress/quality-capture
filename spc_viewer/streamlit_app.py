@@ -3,11 +3,10 @@
 # SPC viewer for Auto-Caliper capture logs
 # • Source: Local folder  OR  GitHub repo (recursive)
 # • Select multiple DIMs; choose Actual (corrected) vs Raw (caliper)
-# • X-axis toggle: Sequence (even spacing) or Timestamp
-# • Optional: reset sequence per Reel
+# • X-axis toggle: Sequence (even spacing) or Timestamp; optional reset per Reel
 # • I-Chart + MR (MR shown when exactly one DIM is selected)
-# • Safe auto-refresh (streamlit_autorefresh if available; else st.autorefresh if present)
-# • Chart titles auto-prefix with inferred part label (e.g., SP-001-25)
+# • NEW: Draw USL/LSL from YAML config (per DIM) when plotting Actual values
+# • Auto-locate YAML by part/profile name (e.g., SP-001-25.yml / .yaml)
 # -------------------------------------------------------------
 
 import io
@@ -28,6 +27,11 @@ try:
     import requests
 except Exception:
     requests = None
+
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 try:
     from streamlit_autorefresh import st_autorefresh as _st_autorefresh
@@ -279,6 +283,76 @@ x_label = "sequence" if x_field == "seq" else "timestamp"
 part_name = infer_part_label(df, file_label)
 chart_title_prefix = f"{part_name} — " if part_name else ""
 
+# ---------------- Specs (LSL/USL) ----------------
+st.sidebar.header("Specs (USL/LSL)")
+
+if source == "Local folder":
+    default_cfg_dir = str((Path(__file__).resolve().parents[1] / "app_capture" / "configs")) \
+                      if (Path(__file__).resolve().parents[1] / "app_capture" / "configs").exists() \
+                      else r"C:\CaliperCapture\configs"
+    cfg_dir_local = st.sidebar.text_input("Config folder (local)", default_cfg_dir)
+    cfg_repo_dir = None
+else:
+    cfg_dir_local = None
+    cfg_repo_dir = st.sidebar.text_input("Config folder in repo", "app_capture/configs").strip()
+    cfg_owner = owner
+    cfg_repo = repo
+    cfg_ref = branch
+
+@st.cache_data
+def load_limits_from_yaml_local(cfg_dir: str, part: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    out = {}
+    if not yaml:
+        return out
+    if not part:
+        return out
+    base = Path(cfg_dir)
+    # try both .yml and .yaml
+    for ext in (".yml", ".yaml"):
+        p = base / f"{part}{ext}"
+        if p.exists():
+            try:
+                data = yaml.safe_load(p.read_text(encoding="utf-8"))
+                feats = data.get("features", [])
+                for f in feats:
+                    name = str(f.get("name", "")).strip()
+                    if name:
+                        out[name.upper()] = (f.get("lsl", None), f.get("usl", None))
+            except Exception:
+                pass
+            break
+    return out
+
+@st.cache_data
+def load_limits_from_yaml_github(owner: str, repo: str, cfg_folder: str, part: str, ref: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    out = {}
+    if not (requests and yaml and part):
+        return out
+    # construct raw URL: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{cfg_folder}/{part}.yml
+    for ext in (".yml", ".yaml"):
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{cfg_folder.strip('/')}/{part}{ext}"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            try:
+                data = yaml.safe_load(r.text)
+                feats = data.get("features", [])
+                for f in feats:
+                    name = str(f.get("name", "")).strip()
+                    if name:
+                        out[name.upper()] = (f.get("lsl", None), f.get("usl", None))
+            except Exception:
+                pass
+            break
+    return out
+
+# Build limits map { "DIM 1": (lsl, usl), ... } (case-insensitive by key)
+limits_by_dim: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+if part_name:
+    if source == "Local folder" and cfg_dir_local:
+        limits_by_dim = load_limits_from_yaml_local(cfg_dir_local, part_name)
+    elif source == "GitHub repo" and cfg_repo_dir:
+        limits_by_dim = load_limits_from_yaml_github(cfg_owner, cfg_repo, cfg_repo_dir, part_name, cfg_ref)
+
 # ---------------- DIM selection ----------------
 # Actual columns are "DIM n"; Raw columns are "_raw_DIM n"
 dim_actual = [c for c in df.columns if c.upper().startswith("DIM ")]
@@ -330,17 +404,18 @@ centers, lcls, ucls, sigmas = {}, {}, {}, {}
 for dim in dim_picks:
     y = get_series_for_dim(df, dim, value_mode)
     fig_i.add_trace(go.Scatter(
-        x=df[x_field], y=y, mode="lines+markers", name=dim,
+        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
+        y=y, mode="lines+markers", name=dim,
         hovertemplate=(
             "%{x}<br>"+dim+"=%{y:.5f}<extra></extra>"
-            if x_field == "seq"
+            if x_mode == "Sequence"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>"+dim+"=%{y:.5f}<extra></extra>"
         ),
     ))
     c, lo, hi, s_hat = individuals_limits(y, sigma_mult)
     centers[dim], lcls[dim], ucls[dim], sigmas[dim] = c, lo, hi, s_hat
 
-# Lines & violations
+# Draw per-DIM center/UCL/LCL or grand mean
 if len(dim_picks) == 1:
     d = dim_picks[0]
     fig_i.add_hline(y=centers[d], line_dash="dash", annotation_text=f"{d} Center {centers[d]:.5f}")
@@ -351,12 +426,12 @@ if len(dim_picks) == 1:
     if viol_mask.any():
         v = df.loc[viol_mask]
         fig_i.add_trace(go.Scatter(
-            x=v[x_field], y=y_d[viol_mask],
-            mode="markers", name=f"{d} Violations",
+            x=v["seq"] if x_mode == "Sequence" else v["timestamp"],
+            y=y_d[viol_mask], mode="markers", name=f"{d} Violations",
             marker=dict(size=10, symbol="x"),
             hovertemplate=(
                 "%{x}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
-                if x_field == "seq"
+                if x_mode == "Sequence"
                 else "%{x|%Y-%m-%d %H:%M:%S}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
             ),
         ))
@@ -368,9 +443,30 @@ else:
         fig_i.add_hline(y=gm, line_dash="dash", annotation_text=f"Grand mean {gm:.5f}")
     title_suffix = f"{len(dim_picks)} DIMs"
 
+# ---- NEW: Spec lines (USL/LSL) when in Actual mode ----
+if value_mode.startswith("Actual"):
+    spec_lines_drawn = False
+    for dim in dim_picks:
+        limits = limits_by_dim.get(dim.upper())
+        if limits:
+            lsl, usl = limits
+            if lsl is not None:
+                fig_i.add_hline(y=float(lsl), line_dash="solid", line_color="gray",
+                                annotation_text=f"{dim} LSL {float(lsl):.5f}")
+                spec_lines_drawn = True
+            if usl is not None:
+                fig_i.add_hline(y=float(usl), line_dash="solid", line_color="gray",
+                                annotation_text=f"{dim} USL {float(usl):.5f}")
+                spec_lines_drawn = True
+    if not spec_lines_drawn:
+        st.caption("Specs: no matching LSL/USL found in YAML for selected DIMs.")
+else:
+    st.caption("Specs hidden: switch to **Actual (corrected)** to view USL/LSL.")
+
 fig_i.update_layout(
-    title=f"{chart_title_prefix}Individuals (I) — {value_mode} — {title_suffix}",
-    xaxis_title=x_label, yaxis_title="Value",
+    title=f"{(infer_part_label(df, file_label) + ' — ') if infer_part_label(df, file_label) else ''}Individuals (I) — {value_mode} — {title_suffix}",
+    xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
+    yaxis_title="Value",
     height=460, hovermode="x unified", legend_title="Series",
 )
 
@@ -388,10 +484,11 @@ if len(dim_picks) == 1:
 
     fig_mr = go.Figure()
     fig_mr.add_trace(go.Scatter(
-        x=df[x_field], y=mr, mode="lines+markers", name=f"{d} MR(2)",
+        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
+        y=mr, mode="lines+markers", name=f"{d} MR(2)",
         hovertemplate=(
             "%{x}<br>MR=%{y:.5f}<extra></extra>"
-            if x_field == "seq"
+            if x_mode == "Sequence"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>MR=%{y:.5f}<extra></extra>"
         ),
     ))
@@ -399,8 +496,9 @@ if len(dim_picks) == 1:
     fig_mr.add_hline(y=MR_UCL, line_dash="dot",  annotation_text=f"{d} UCL {MR_UCL:.5f}")
     fig_mr.add_hline(y=MR_LCL, line_dash="dot",  annotation_text=f"{d} LCL {MR_LCL:.5f}")
     fig_mr.update_layout(
-        title=f"{chart_title_prefix}Moving Range (MR) — {d}",
-        xaxis_title=x_label, yaxis_title="|ΔX|",
+        title=f"{infer_part_label(df, file_label)+' — ' if infer_part_label(df, file_label) else ''}Moving Range (MR) — {d}",
+        xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
+        yaxis_title="|ΔX|",
         height=320, hovermode="x unified", legend_title="Series",
     )
     st.plotly_chart(fig_mr, use_container_width=True)
@@ -426,4 +524,4 @@ if refresh_s > 0:
         auto = getattr(st, "autorefresh", None)
         if callable(auto):
             auto(interval=int(refresh_s * 1000), key="spc-autorefresh")
-        # On older Streamlit with neither available: no-op; click Rerun manually.
+        # On older Streamlit: no-op; click Rerun manually.
