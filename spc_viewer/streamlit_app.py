@@ -3,10 +3,11 @@
 # SPC viewer for Auto-Caliper capture logs
 # • Source: Local folder  OR  GitHub repo (recursive)
 # • Select multiple DIMs; choose Actual (corrected) vs Raw (caliper)
-# • X-axis toggle: Sequence (even spacing) or Timestamp; optional reset per Reel
-# • I-Chart + MR (MR shown when exactly one DIM is selected)
+# • X-axis: Sequence (even spacing) or Timestamp; optional reset per Reel
+# • I-Chart + MR (MR when exactly one DIM selected)
 # • USL/LSL from YAML config (per DIM) when plotting Actual values
 # • Robust YAML parsing + manual pickers; auto-infer part/profile (SP-001-XX)
+# • Local loader supports extensionless config files and common subfolders
 # -------------------------------------------------------------
 
 import io
@@ -22,7 +23,7 @@ import streamlit as st
 from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple, List, Dict
 
-# Optional libs (only needed for GitHub mode / YAML)
+# Optional libs (GitHub / YAML)
 try:
     import requests
 except Exception:
@@ -132,7 +133,7 @@ def infer_part_label(df: pd.DataFrame, file_label: str) -> str:
                     return m.group(0).upper()
                 if v.upper().startswith("SP-"):
                     return v.upper()
-    # 2) Scan first few rows for SP-###-##
+    # 2) Scan first few rows
     try:
         sample = " ".join(map(str, df.head(10).fillna("").values.flatten()))
         m = re.search(r"SP-\d{3}-\d{2}", sample, flags=re.IGNORECASE)
@@ -140,7 +141,7 @@ def infer_part_label(df: pd.DataFrame, file_label: str) -> str:
             return m.group(0).upper()
     except Exception:
         pass
-    # 3) Look in the path/label
+    # 3) Look in path/label
     try:
         parts = list(Path(file_label).parts) + list(PurePosixPath(file_label).parts)
         for seg in reversed(parts):
@@ -158,14 +159,12 @@ def list_files_debug_local(folder: str, patt: str) -> Dict:
     try:
         info["exists"] = os.path.isdir(folder)
         if info["exists"]:
-            # RECURSIVE: include subfolders
             all_files = [str(p) for p in Path(folder).rglob("*") if p.is_file()]
             info["files_all"] = sorted(all_files, key=os.path.getmtime, reverse=True)
             patt_lower = patt.lower()
             candidates = []
             for f in all_files:
-                name = os.path.basename(f)
-                name_lower = name.lower()
+                name_lower = os.path.basename(f).lower()
                 if patt_lower.replace("*", "") in name_lower or glob.fnmatch.fnmatch(name_lower, patt_lower):
                     candidates.append(f)
             info["files_match"] = [f for f in candidates if os.path.splitext(f)[1].lower() in (".csv", ".xlsx")]
@@ -191,20 +190,13 @@ def load_local_file(path: str, mtime: float) -> pd.DataFrame:
 
 # ---------------- GitHub mode (recursive) ----------------
 def gh_list_files_recursive(owner: str, repo: str, base_path: str, ref: str = "main"):
-    """
-    Recursively list CSV/XLSX files under base_path (public repos) using Git Trees API.
-    Returns items: {"name", "path", "download_url"} (raw URL).
-    """
     if requests is None:
         raise RuntimeError("requests not installed. pip install requests")
     base_path = base_path.strip("/")
     api = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}"
     r = requests.get(api, params={"recursive": "1"}, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    tree = data.get("tree", [])
-    if not isinstance(tree, list):
-        return []
+    tree = r.json().get("tree", [])
     results = []
     for entry in tree:
         if entry.get("type") != "blob":
@@ -227,7 +219,6 @@ def gh_download_any(download_url: str, ext: str) -> pd.DataFrame:
     buf = io.BytesIO(r.content)
     return pd.read_excel(buf) if ext == ".xlsx" else pd.read_csv(buf)
 
-# --- GitHub YAML listing (for manual picker)
 def gh_list_yamls(owner: str, repo: str, cfg_folder: str, ref: str = "main"):
     if requests is None:
         return []
@@ -312,7 +303,7 @@ else:
 
     files_csv = [it for it in files if it["name"].lower().endswith(".csv")]
     files_xlsx = [it for it in files if it["name"].lower().endswith(".xlsx")]
-    files = files_csv + files_xlsx  # already sorted by name desc
+    files = files_csv + files_xlsx
 
     pick_latest = st.sidebar.checkbox("Always use most recent file", True)
     chosen = files[0] if pick_latest else st.sidebar.selectbox("Choose file", files, index=0, format_func=lambda it: it["name"])
@@ -332,7 +323,6 @@ if profile_filter and "profile" in df.columns:
 if reel_filter and "reel" in df.columns:
     df = df[df["reel"].astype(str).str.upper() == reel_filter]
 
-# Build sequence index (1..N). Optionally reset per Reel.
 if reset_seq_per_reel and "reel" in df.columns:
     df = df.copy()
     df["seq"] = (df.groupby(df["reel"].astype(str), dropna=False).cumcount() + 1)
@@ -343,7 +333,7 @@ else:
 x_field = "seq" if x_mode == "Sequence" else "timestamp"
 x_label = "sequence" if x_field == "seq" else "timestamp"
 
-# Infer part label for chart titles, allow override
+# Infer part label + override
 part_name_inferred = infer_part_label(df, file_label)
 part_override = st.sidebar.text_input("Override Part/Profile (optional)", value=part_name_inferred).strip().upper()
 part_name = part_override or part_name_inferred
@@ -352,120 +342,119 @@ chart_title_prefix = f"{part_name} — " if part_name else ""
 # ---------------- Specs (USL/LSL) ----------------
 st.sidebar.header("Specs (USL/LSL)")
 
-# Load limits (auto), with manual picker fallback
+limits_by_dim: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+spec_src = "n/a"
+
 if source == "Local folder":
     default_cfg_dir = str((Path(__file__).resolve().parents[1] / "app_capture" / "configs")) \
                       if (Path(__file__).resolve().parents[1] / "app_capture" / "configs").exists() \
                       else r"C:\CaliperCapture\configs"
     cfg_dir_local = st.sidebar.text_input("Config folder (local)", default_cfg_dir)
 
-    
-@st.cache_data
-def load_limits_from_yaml_local(cfg_dir: str, part: str):
-    """
-    Returns (limits_by_dim, source_note).
+    @st.cache_data
+    def load_limits_from_yaml_local(cfg_dir: str, part: str):
+        """
+        Returns (limits_by_dim, source_note).
 
-    Tries in order:
-      1) {cfg_dir}/{part}              (no extension)
-      2) {cfg_dir}/{part}.yml/.yaml
-      3) {cfg_dir}/{part}/{part}       (no extension)
-      4) {cfg_dir}/{part}/{part}.yml/.yaml
-      5) {cfg_dir}/{part}/config       (no extension)
-      6) {cfg_dir}/{part}/config.yml/.yaml
-      7) Recursive scan for a YAML whose top-level 'profile' == part
-    """
-    if not yaml or not part:
-        return {}, "no-yaml-or-part"
+        Tries in order:
+          1) {cfg_dir}/{part}              (no extension)
+          2) {cfg_dir}/{part}.yml/.yaml
+          3) {cfg_dir}/{part}/{part}       (no extension)
+          4) {cfg_dir}/{part}/{part}.yml/.yaml
+          5) {cfg_dir}/{part}/config       (no extension)
+          6) {cfg_dir}/{part}/config.yml/.yaml
+          7) Recursive scan for a file whose top-level 'profile' == part
+        """
+        if not yaml or not part:
+            return {}, "no-yaml-or-part"
 
-    base = Path(cfg_dir)
-    tried = []
+        base = Path(cfg_dir)
+        tried = []
 
-    def _try_file(p: Path, label: str):
-        if p.exists() and p.is_file():
+        def _try_file(p: Path, label: str):
+            if p.exists() and p.is_file():
+                try:
+                    text = p.read_text(encoding="utf-8")
+                    data = yaml.safe_load(text) or {}
+                    return _parse_limits_from_yaml_dict(data), label
+                except Exception:
+                    pass
+            tried.append(str(p))
+            return None
+
+        # 1) {cfg_dir}/{part} (extensionless)
+        r = _try_file(base / part, f"file:{part}(no-ext)")
+        if r: return r
+
+        # 2) {cfg_dir}/{part}.yml/.yaml
+        for ext in (".yml", ".yaml"):
+            r = _try_file(base / f"{part}{ext}", f"file:{part}{ext}")
+            if r: return r
+
+        # 3) {cfg_dir}/{part}/{part} (extensionless)
+        r = _try_file(base / part / part, f"file:{part}/{part}(no-ext)")
+        if r: return r
+
+        # 4) {cfg_dir}/{part}/{part}.yml/.yaml
+        for ext in (".yml", ".yaml"):
+            r = _try_file(base / part / f"{part}{ext}", f"file:{part}/{part}{ext}")
+            if r: return r
+
+        # 5) {cfg_dir}/{part}/config (extensionless)
+        r = _try_file(base / part / "config", f"file:{part}/config(no-ext)")
+        if r: return r
+
+        # 6) {cfg_dir}/{part}/config.yml/.yaml
+        for ext in (".yml", ".yaml"):
+            r = _try_file(base / part / f"config{ext}", f"file:{part}/config{ext}")
+            if r: return r
+
+        # 7) Recursive scan for profile match (accept extensionless or .yml/.yaml)
+        for p in base.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in ("", ".yml", ".yaml"):
+                continue
             try:
                 text = p.read_text(encoding="utf-8")
                 data = yaml.safe_load(text) or {}
-                return _parse_limits_from_yaml_dict(data), label
+                prof = (data.get("profile") or data.get("PROFILE") or "").strip().upper()
+                if prof == part:
+                    return _parse_limits_from_yaml_dict(data), f"file:{p.as_posix()}(profile-match)"
             except Exception:
-                pass
-        tried.append(str(p))
-        return None
+                continue
 
-    # 1) {cfg_dir}/{part} (extensionless)
-    r = _try_file(base / part, f"file:{part}(no-ext)")
-    if r: return r
+        return {}, "not-found:" + ";".join(tried)
 
-    # 2) {cfg_dir}/{part}.yml/.yaml
-    for ext in (".yml", ".yaml"):
-        r = _try_file(base / f"{part}{ext}", f"file:{part}{ext}")
-        if r: return r
-
-    # 3) {cfg_dir}/{part}/{part} (extensionless)
-    r = _try_file(base / part / part, f"file:{part}/{part}(no-ext)")
-    if r: return r
-
-    # 4) {cfg_dir}/{part}/{part}.yml/.yaml
-    for ext in (".yml", ".yaml"):
-        r = _try_file(base / part / f"{part}{ext}", f"file:{part}/{part}{ext}")
-        if r: return r
-
-    # 5) {cfg_dir}/{part}/config (extensionless)
-    r = _try_file(base / part / "config", f"file:{part}/config(no-ext)")
-    if r: return r
-
-    # 6) {cfg_dir}/{part}/config.yml/.yaml
-    for ext in (".yml", ".yaml"):
-        r = _try_file(base / part / f"config{ext}", f"file:{part}/config{ext}")
-        if r: return r
-
-    # 7) Recursive scan for profile match
-    for p in base.rglob("*"):
-        if not p.is_file():
-            continue
-        # Accept extensionless OR .yml/.yaml
-        if p.suffix.lower() not in ("", ".yml", ".yaml"):
-            continue
-        try:
-            text = p.read_text(encoding="utf-8")
-            data = yaml.safe_load(text) or {}
-            prof = (data.get("profile") or data.get("PROFILE") or "").strip().upper()
-            if prof == part:
-                return _parse_limits_from_yaml_dict(data), f"file:{p.as_posix()}(profile-match)"
-        except Exception:
-            continue
-
-    return {}, "not-found:" + ";".join(tried)
-
-
-    limits_by_dim, spec_src = load_limits_from_yaml_local(cfg_dir_local, part_name)
+    if part_name:
+        limits_by_dim, spec_src = load_limits_from_yaml_local(cfg_dir_local, part_name)
 
     # Manual YAML pick (local)
     try:
-        ymls_local = sorted([p.name for p in Path(cfg_dir_local).glob("*.yml")] +
-                            [p.name for p in Path(cfg_dir_local).glob("*.yaml")])
+        items_local = [p for p in Path(cfg_dir_local).rglob("*") if p.is_file() and p.suffix.lower() in ("", ".yml", ".yaml")]
+        names_local = ["(auto)"] + [str(p.relative_to(cfg_dir_local)) for p in sorted(items_local)]
     except Exception:
-        ymls_local = []
-    pick_local = st.sidebar.selectbox("(Optional) Choose YAML (local)", ["(auto)"] + ymls_local, index=0)
+        items_local, names_local = [], ["(auto)"]
+    pick_local = st.sidebar.selectbox("(Optional) Choose config (local)", names_local, index=0)
     if pick_local != "(auto)":
         fp = Path(cfg_dir_local) / pick_local
         try:
             data = yaml.safe_load(fp.read_text(encoding="utf-8")) or {}
             limits_by_dim = _parse_limits_from_yaml_dict(data)
-            spec_src = f"manual:{pick_local}"
+            spec_src = f"manual:{fp.as_posix()}"
         except Exception as e:
             st.sidebar.error(f"Failed reading {pick_local}: {e}")
 
 else:
     cfg_repo_dir = st.sidebar.text_input("Config folder in repo", "app_capture/configs").strip()
-
-    def gh_list_yamls_cached(owner, repo, folder, ref):
-        return gh_list_yamls(owner, repo, folder, ref)
+    owner = st.sidebar.text_input("GitHub owner/org (for specs)", "").strip() or owner
+    repo = st.sidebar.text_input("Repo (for specs)", "").strip() or repo
+    branch = st.sidebar.text_input("Branch/Ref (for specs)", "").strip() or branch
 
     @st.cache_data
     def load_limits_from_yaml_github(owner: str, repo: str, cfg_folder: str, part: str, ref: str):
         if not (requests and yaml and part):
             return {}, "no-requests-or-yaml-or-part"
-        # Try direct name
         for ext in (".yml", ".yaml"):
             url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{cfg_folder.strip('/')}/{part}{ext}"
             r = requests.get(url, timeout=15)
@@ -473,7 +462,7 @@ else:
                 data = yaml.safe_load(r.text) or {}
                 return _parse_limits_from_yaml_dict(data), f"url:{part}{ext}"
         # Fallback: scan to find profile match
-        items = gh_list_yamls_cached(owner, repo, cfg_folder, ref)
+        items = gh_list_yamls(owner, repo, cfg_folder, ref)
         for it in items:
             r = requests.get(it["download_url"], timeout=15)
             if r.status_code == 200:
@@ -486,11 +475,12 @@ else:
                     pass
         return {}, "not-found"
 
-    limits_by_dim, spec_src = load_limits_from_yaml_github(owner, repo, cfg_repo_dir, part_name, branch)
+    if part_name:
+        limits_by_dim, spec_src = load_limits_from_yaml_github(owner, repo, cfg_repo_dir, part_name, branch)
 
     # Manual YAML pick (GitHub)
     try:
-        ymls_remote = gh_list_yamls_cached(owner, repo, cfg_repo_dir, branch)
+        ymls_remote = gh_list_yamls(owner, repo, cfg_repo_dir, branch)
     except Exception:
         ymls_remote = []
     names_remote = ["(auto)"] + [it["name"] for it in ymls_remote]
@@ -509,14 +499,12 @@ with st.expander("🔧 Specs Debug", expanded=False):
     st.write({"effective_part": part_name, "spec_source": spec_src, "limits_keys": list(limits_by_dim.keys())})
 
 # ---------------- DIM selection ----------------
-# Actual columns are "DIM n"; Raw columns are "_raw_DIM n"
 dim_actual = [c for c in df.columns if _norm_dim_key(c).startswith("DIM ")]
-dims_available: List[str] = []
-# Keep original nice names but sort by DIM number
 def _dim_sort_key(s: str) -> Tuple[int, str]:
     digits = ''.join(ch for ch in _norm_dim_key(s) if ch.isdigit())
     return (int(digits) if digits else 9999, s)
 
+dims_available: List[str] = []
 for c in sorted(dim_actual, key=_dim_sort_key):
     if c not in dims_available:
         dims_available.append(c)
@@ -565,17 +553,17 @@ centers, lcls, ucls, sigmas = {}, {}, {}, {}
 for dim in dim_picks:
     y = get_series_for_dim(df, dim, value_mode)
     fig_i.add_trace(go.Scatter(
-        x=df[x_field], y=y, mode="lines+markers", name=dim,
+        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
+        y=y, mode="lines+markers", name=dim,
         hovertemplate=(
             "%{x}<br>"+dim+"=%{y:.5f}<extra></extra>"
-            if x_field == "seq"
+            if x_mode == "Sequence"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>"+dim+"=%{y:.5f}<extra></extra>"
         ),
     ))
     c, lo, hi, s_hat = individuals_limits(y, sigma_mult)
     centers[dim], lcls[dim], ucls[dim], sigmas[dim] = c, lo, hi, s_hat
 
-# Lines & violations
 if len(dim_picks) == 1:
     d = dim_picks[0]
     fig_i.add_hline(y=centers[d], line_dash="dash", annotation_text=f"{d} Center {centers[d]:.5f}")
@@ -586,12 +574,12 @@ if len(dim_picks) == 1:
     if viol_mask.any():
         v = df.loc[viol_mask]
         fig_i.add_trace(go.Scatter(
-            x=v[x_field], y=y_d[viol_mask],
-            mode="markers", name=f"{d} Violations",
+            x=v["seq"] if x_mode == "Sequence" else v["timestamp"],
+            y=y_d[viol_mask], mode="markers", name=f"{d} Violations",
             marker=dict(size=10, symbol="x"),
             hovertemplate=(
                 "%{x}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
-                if x_field == "seq"
+                if x_mode == "Sequence"
                 else "%{x|%Y-%m-%d %H:%M:%S}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
             ),
         ))
@@ -619,13 +607,14 @@ if value_mode.startswith("Actual"):
                                 annotation_text=f"{dim} USL {float(usl):.5f}")
                 spec_lines_drawn = True
     if not spec_lines_drawn:
-        st.caption("Specs: no matching LSL/USL found in YAML for selected DIMs.")
+        st.caption("Specs: no matching LSL/LSL found in YAML for selected DIMs.")
 else:
     st.caption("Specs hidden: switch to **Actual (corrected)** to view USL/LSL.")
 
 fig_i.update_layout(
     title=f"{chart_title_prefix}Individuals (I) — {value_mode} — {title_suffix}",
-    xaxis_title=x_label, yaxis_title="Value",
+    xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
+    yaxis_title="Value",
     height=460, hovermode="x unified", legend_title="Series",
 )
 
@@ -643,10 +632,11 @@ if len(dim_picks) == 1:
 
     fig_mr = go.Figure()
     fig_mr.add_trace(go.Scatter(
-        x=df[x_field], y=mr, mode="lines+markers", name=f"{d} MR(2)",
+        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
+        y=mr, mode="lines+markers", name=f"{d} MR(2)",
         hovertemplate=(
             "%{x}<br>MR=%{y:.5f}<extra></extra>"
-            if x_field == "seq"
+            if x_mode == "Sequence"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>MR=%{y:.5f}<extra></extra>"
         ),
     ))
@@ -655,7 +645,8 @@ if len(dim_picks) == 1:
     fig_mr.add_hline(y=MR_LCL, line_dash="dot",  annotation_text=f"{d} LCL {MR_LCL:.5f}")
     fig_mr.update_layout(
         title=f"{chart_title_prefix}Moving Range (MR) — {d}",
-        xaxis_title=x_label, yaxis_title="|ΔX|",
+        xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
+        yaxis_title="|ΔX|",
         height=320, hovermode="x unified", legend_title="Series",
     )
     st.plotly_chart(fig_mr, use_container_width=True)
