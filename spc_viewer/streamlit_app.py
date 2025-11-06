@@ -1,26 +1,34 @@
-# streamlit_app.py — multi-DIM + Raw/Actual selector
+# streamlit_app.py
 # -------------------------------------------------------------
-# • Local/GitHub modes (from previous version)
-# • Select multiple DIMs for the Individuals chart
-# • Toggle: Actual (corrected) vs Raw (caliper)
-# • MR chart shows when exactly ONE DIM is selected
-# • Works with .csv/.xlsx; adds debug expander
+# SPC viewer for Auto-Caliper capture logs
+# • Source: Local folder  OR  GitHub repo (recursive)
+# • Select multiple DIMs; choose Actual (corrected) vs Raw (caliper)
+# • X-axis toggle: Sequence (even spacing) or Timestamp
+# • Optional: reset sequence per Reel
+# • I-Chart + MR (MR shown when exactly one DIM is selected)
+# • Safe auto-refresh (streamlit_autorefresh if available; else st.autorefresh if present)
+# • Chart titles auto-prefix with inferred part label (e.g., SP-001-25)
 # -------------------------------------------------------------
 
-import os, time, glob, io
-from pathlib import Path
-from typing import Optional, Tuple, List, Dict
-
+import io
+import os
+import re
+import time
+import glob
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# Optional libs
+from pathlib import Path, PurePosixPath
+from typing import Optional, Tuple, List, Dict
+
+# Optional libs (only needed for GitHub mode / Cloud refresh)
 try:
     import requests
 except Exception:
     requests = None
+
 try:
     from streamlit_autorefresh import st_autorefresh as _st_autorefresh
 except Exception:
@@ -28,7 +36,7 @@ except Exception:
 
 st.set_page_config(page_title="SPC Viewer", layout="wide")
 
-# ---------------- Sidebar: Source & common controls ----------------
+# ---------------- Sidebar: Source & controls ----------------
 st.sidebar.header("Source")
 source = st.sidebar.radio("Where are the logs?", ["Local folder", "GitHub repo"], index=0)
 
@@ -47,6 +55,10 @@ window_pts = st.sidebar.number_input("Show last N points (0 = all)", 0, 50000, 0
 show_table = st.sidebar.checkbox("Show data table", False)
 refresh_s = st.sidebar.slider("Auto-refresh (seconds)", 0, 120, 10, 1)
 
+st.sidebar.header("X-Axis")
+x_mode = st.sidebar.radio("Plot against", ["Sequence", "Timestamp"], index=0)
+reset_seq_per_reel = st.sidebar.checkbox("Reset sequence per Reel", False)
+
 # ---------------- Helpers ----------------
 def is_numeric_series(s: pd.Series) -> bool:
     try:
@@ -63,14 +75,46 @@ def individuals_limits(series: pd.Series, sigma_mult: float) -> Tuple[float, flo
     lcl = center - sigma_mult * sigma_hat
     return center, lcl, ucl, sigma_hat
 
-# ---------------- Local mode helpers ----------------
+def infer_part_label(df: pd.DataFrame, file_label: str) -> str:
+    # 1) Try standard columns
+    for col in ("part_id", "profile"):
+        if col in df.columns:
+            vals = df[col].dropna().astype(str)
+            if not vals.empty:
+                v = vals.iloc[0]
+                m = re.search(r"SP-\d{3}-\d{2}", v, flags=re.IGNORECASE)
+                if m:
+                    return m.group(0).upper()
+                if v.upper().startswith("SP-"):
+                    return v.upper()
+    # 2) Scan first few rows for SP-###-##
+    try:
+        sample = " ".join(map(str, df.head(10).fillna("").values.flatten()))
+        m = re.search(r"SP-\d{3}-\d{2}", sample, flags=re.IGNORECASE)
+        if m:
+            return m.group(0).upper()
+    except Exception:
+        pass
+    # 3) Look in the path/label
+    try:
+        parts = list(Path(file_label).parts) + list(PurePosixPath(file_label).parts)
+        for seg in reversed(parts):
+            m = re.search(r"SP-\d{3}-\d{2}", seg, flags=re.IGNORECASE)
+            if m:
+                return m.group(0).upper()
+    except Exception:
+        pass
+    return ""
+
+# ---------------- Local mode ----------------
 def list_files_debug_local(folder: str, patt: str) -> Dict:
     info = {"mode": "local", "folder": folder, "pattern": patt, "exists": False,
             "files_all": [], "files_match": [], "error": None}
     try:
         info["exists"] = os.path.isdir(folder)
         if info["exists"]:
-            all_files = [str(p) for p in Path(folder).glob("*") if Path(p).is_file()]
+            # RECURSIVE: include subfolders
+            all_files = [str(p) for p in Path(folder).rglob("*") if p.is_file()]
             info["files_all"] = sorted(all_files, key=os.path.getmtime, reverse=True)
             patt_lower = patt.lower()
             candidates = []
@@ -100,21 +144,36 @@ def load_local_file(path: str, mtime: float) -> pd.DataFrame:
         raise last_err
     return pd.read_excel(path) if ext == ".xlsx" else pd.read_csv(path)
 
-# ---------------- GitHub mode helpers ----------------
-def gh_list_files(owner: str, repo: str, path: str, ref: str = "main") -> List[Dict]:
+# ---------------- GitHub mode (recursive) ----------------
+def gh_list_files_recursive(owner: str, repo: str, base_path: str, ref: str = "main"):
+    """
+    Recursively list CSV/XLSX files under base_path (public repos) using Git Trees API.
+    Returns items: {"name", "path", "download_url"} (raw URL).
+    """
     if requests is None:
         raise RuntimeError("requests not installed. pip install requests")
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    r = requests.get(url, params={"ref": ref}, timeout=15)
+    base_path = base_path.strip("/")
+    api = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}"
+    r = requests.get(api, params={"recursive": "1"}, timeout=20)
     r.raise_for_status()
-    items = r.json()
-    if not isinstance(items, list):
+    data = r.json()
+    tree = data.get("tree", [])
+    if not isinstance(tree, list):
         return []
-    return [
-        {"name": it["name"], "path": it["path"], "download_url": it.get("download_url", "")}
-        for it in items
-        if it.get("type") == "file" and str(it.get("name", "")).lower().endswith((".csv", ".xlsx"))
-    ]
+    results = []
+    for entry in tree:
+        if entry.get("type") != "blob":
+            continue
+        path = entry.get("path", "")
+        if not path.lower().startswith(base_path.lower() + "/"):
+            continue
+        if not path.lower().endswith((".csv", ".xlsx")):
+            continue
+        name = path.split("/")[-1]
+        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+        results.append({"name": name, "path": path, "download_url": raw_url})
+    results.sort(key=lambda it: it["name"], reverse=True)
+    return results
 
 @st.cache_data
 def gh_download_any(download_url: str, ext: str) -> pd.DataFrame:
@@ -157,26 +216,36 @@ if source == "Local folder":
     last_modified = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
 
 else:
-    st.sidebar.write("Pull from a **public GitHub repo**")
+    st.sidebar.write("Pull from a **public GitHub repo** (recursive under folder path)")
     owner = st.sidebar.text_input("GitHub owner/org", "your-org-or-user").strip()
-    repo  = st.sidebar.text_input("Repo", "caliper-quality-suite").strip()
+    repo  = st.sidebar.text_input("Repo", "caliper-logs").strip()
     folder_path = st.sidebar.text_input("Folder path in repo", "app_capture/Logs").strip()
     branch = st.sidebar.text_input("Branch/Ref", "main").strip()
+
     if not (owner and repo and folder_path):
         st.info("Enter owner, repo, and folder path.")
         st.stop()
+
     try:
-        listing = gh_list_files(owner, repo, folder_path, ref=branch)
+        listing = gh_list_files_recursive(owner, repo, folder_path, ref=branch)
     except Exception as e:
         st.error(f"GitHub listing failed:\n{e}")
         st.stop()
+
+    with st.expander("🔎 Debug (GitHub files)", expanded=False):
+        st.write("Base path:", folder_path)
+        st.write("Total matches:", len(listing))
+        st.write(pd.DataFrame(listing[:10]))
+
     files = [it for it in listing if (order_id == "" or it["name"].upper().startswith(order_id + "_"))]
     if not files:
         st.error("No matching CSV/XLSX in the GitHub folder (check Order ID and path).")
         st.stop()
+
     files_csv = [it for it in files if it["name"].lower().endswith(".csv")]
     files_xlsx = [it for it in files if it["name"].lower().endswith(".xlsx")]
-    files = sorted(files_csv + files_xlsx, key=lambda it: it["name"], reverse=True)
+    files = files_csv + files_xlsx  # already sorted by name desc
+
     pick_latest = st.sidebar.checkbox("Always use most recent file", True)
     chosen = files[0] if pick_latest else st.sidebar.selectbox("Choose file", files, index=0, format_func=lambda it: it["name"])
     ext = ".xlsx" if chosen["name"].lower().endswith(".xlsx") else ".csv"
@@ -184,7 +253,7 @@ else:
     file_label = f"{owner}/{repo}/{chosen['path']}"
     last_modified = "(GitHub fetch)"
 
-# ---------------- Clean & filter ----------------
+# ---------------- Clean, filters, sequence ----------------
 if "timestamp" in df.columns:
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 else:
@@ -195,57 +264,60 @@ if profile_filter and "profile" in df.columns:
 if reel_filter and "reel" in df.columns:
     df = df[df["reel"].astype(str).str.upper() == reel_filter]
 
-# Identify DIMs present (Actual columns are "DIM n"; Raw columns are "_raw_DIM n")
+# Build sequence index (1..N). Optionally reset per Reel.
+if reset_seq_per_reel and "reel" in df.columns:
+    df = df.copy()
+    df["seq"] = (df.groupby(df["reel"].astype(str), dropna=False).cumcount() + 1)
+else:
+    df = df.copy()
+    df["seq"] = range(1, len(df) + 1)
+
+x_field = "seq" if x_mode == "Sequence" else "timestamp"
+x_label = "sequence" if x_field == "seq" else "timestamp"
+
+# Infer part label for chart titles
+part_name = infer_part_label(df, file_label)
+chart_title_prefix = f"{part_name} — " if part_name else ""
+
+# ---------------- DIM selection ----------------
+# Actual columns are "DIM n"; Raw columns are "_raw_DIM n"
 dim_actual = [c for c in df.columns if c.upper().startswith("DIM ")]
-# derive a clean list of DIM names like "DIM 1","DIM 2", keeping only those where either Actual or Raw exists as numeric
 dims_available: List[str] = []
 for c in sorted(dim_actual, key=lambda s: (int(''.join(ch for ch in s if ch.isdigit()) or 1), s)):
     dims_available.append(c)
-# If there are DIMs that only exist as raw (edge case), include them too
 for c in df.columns:
     if c.startswith("_raw_DIM "):
         base = c.replace("_raw_", "")
         if base not in dims_available:
             dims_available.append(base)
 
-# UI: pick DIMs (multi-select)
 if not dims_available:
     st.error("No DIM columns found.")
     st.stop()
-dim_picks = st.sidebar.multiselect("Select DIMs to plot", dims_available, default=dims_available[:1])
 
-# Short-circuit if none picked
+dim_picks = st.sidebar.multiselect("Select DIMs to plot", dims_available, default=dims_available[:1])
 if not dim_picks:
     st.info("Select at least one DIM to plot from the sidebar.")
     st.stop()
-
-st.subheader(f"File: {file_label}")
-st.caption(f"Last modified: {last_modified}")
-st.write(f"**Values:** {value_mode}  · **Rows:** {len(df)}  · **DIMs:** {', '.join(dim_picks)}")
 
 # Window
 if window_pts and window_pts > 0:
     df = df.tail(int(window_pts)).copy()
 
-# Helper to fetch the series by mode
 def get_series_for_dim(frame: pd.DataFrame, dim_name: str, mode: str) -> pd.Series:
     if mode.startswith("Actual"):
-        # corrected lives in the DIM column itself
         col = dim_name
         if col in frame.columns:
             return pd.to_numeric(frame[col], errors="coerce").astype(float)
-        # fallback: if only raw exists, warn
         raw_col = "_raw_" + dim_name
         if raw_col in frame.columns:
             st.warning(f"{dim_name}: Actual column missing; using RAW as fallback")
             return pd.to_numeric(frame[raw_col], errors="coerce").astype(float)
         return pd.Series(dtype=float)
     else:
-        # Raw (caliper)
         raw_col = "_raw_" + dim_name
         if raw_col in frame.columns:
             return pd.to_numeric(frame[raw_col], errors="coerce").astype(float)
-        # fallback: if raw missing, use actual
         if dim_name in frame.columns:
             st.warning(f"{dim_name}: RAW column missing; using ACTUAL as fallback")
             return pd.to_numeric(frame[dim_name], errors="coerce").astype(float)
@@ -258,31 +330,38 @@ centers, lcls, ucls, sigmas = {}, {}, {}, {}
 for dim in dim_picks:
     y = get_series_for_dim(df, dim, value_mode)
     fig_i.add_trace(go.Scatter(
-        x=df["timestamp"], y=y, mode="lines+markers", name=dim,
-        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>"+dim+"=%{y:.5f}<extra></extra>",
+        x=df[x_field], y=y, mode="lines+markers", name=dim,
+        hovertemplate=(
+            "%{x}<br>"+dim+"=%{y:.5f}<extra></extra>"
+            if x_field == "seq"
+            else "%{x|%Y-%m-%d %H:%M:%S}<br>"+dim+"=%{y:.5f}<extra></extra>"
+        ),
     ))
-    # compute per-dim limits for legend display (we won't draw per-dim lines to avoid clutter)
     c, lo, hi, s_hat = individuals_limits(y, sigma_mult)
     centers[dim], lcls[dim], ucls[dim], sigmas[dim] = c, lo, hi, s_hat
 
-# If exactly one DIM, draw its control lines; if many, show an average center line for context
+# Lines & violations
 if len(dim_picks) == 1:
     d = dim_picks[0]
     fig_i.add_hline(y=centers[d], line_dash="dash", annotation_text=f"{d} Center {centers[d]:.5f}")
     fig_i.add_hline(y=ucls[d], line_dash="dot",  annotation_text=f"{d} UCL {ucls[d]:.5f}")
     fig_i.add_hline(y=lcls[d], line_dash="dot",  annotation_text=f"{d} LCL {lcls[d]:.5f}")
-    viol_mask = (get_series_for_dim(df, d, value_mode) < lcls[d]) | (get_series_for_dim(df, d, value_mode) > ucls[d])
+    y_d = get_series_for_dim(df, d, value_mode)
+    viol_mask = (y_d < lcls[d]) | (y_d > ucls[d])
     if viol_mask.any():
         v = df.loc[viol_mask]
         fig_i.add_trace(go.Scatter(
-            x=v["timestamp"], y=get_series_for_dim(df, d, value_mode)[viol_mask],
+            x=v[x_field], y=y_d[viol_mask],
             mode="markers", name=f"{d} Violations",
             marker=dict(size=10, symbol="x"),
-            hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>",
+            hovertemplate=(
+                "%{x}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
+                if x_field == "seq"
+                else "%{x|%Y-%m-%d %H:%M:%S}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
+            ),
         ))
     title_suffix = f"{d} · μ≈{centers[d]:.5f} · σ̂≈{(sigmas[d] if pd.notna(sigmas[d]) else 0):.5f}"
 else:
-    # multi-dim: draw a grand mean line (of all plotted series means) for context
     means = [centers[d] for d in dim_picks if pd.notna(centers[d])]
     if means:
         gm = float(np.mean(means))
@@ -290,14 +369,14 @@ else:
     title_suffix = f"{len(dim_picks)} DIMs"
 
 fig_i.update_layout(
-    title=f"Individuals (I) — {value_mode} — {title_suffix}",
-    xaxis_title="timestamp", yaxis_title="Value",
+    title=f"{chart_title_prefix}Individuals (I) — {value_mode} — {title_suffix}",
+    xaxis_title=x_label, yaxis_title="Value",
     height=460, hovermode="x unified", legend_title="Series",
 )
 
 st.plotly_chart(fig_i, use_container_width=True)
 
-# ---------------- MR chart (single-dim only) ----------------
+# ---------------- MR chart (single-DIM only) ----------------
 if len(dim_picks) == 1:
     d = dim_picks[0]
     y = get_series_for_dim(df, d, value_mode)
@@ -309,15 +388,19 @@ if len(dim_picks) == 1:
 
     fig_mr = go.Figure()
     fig_mr.add_trace(go.Scatter(
-        x=df["timestamp"], y=mr, mode="lines+markers", name=f"{d} MR(2)",
-        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>MR=%{y:.5f}<extra></extra>",
+        x=df[x_field], y=mr, mode="lines+markers", name=f"{d} MR(2)",
+        hovertemplate=(
+            "%{x}<br>MR=%{y:.5f}<extra></extra>"
+            if x_field == "seq"
+            else "%{x|%Y-%m-%d %H:%M:%S}<br>MR=%{y:.5f}<extra></extra>"
+        ),
     ))
     fig_mr.add_hline(y=Rbar,   line_dash="dash", annotation_text=f"{d} Ȓ {Rbar:.5f}")
     fig_mr.add_hline(y=MR_UCL, line_dash="dot",  annotation_text=f"{d} UCL {MR_UCL:.5f}")
     fig_mr.add_hline(y=MR_LCL, line_dash="dot",  annotation_text=f"{d} LCL {MR_LCL:.5f}")
     fig_mr.update_layout(
-        title=f"Moving Range (MR) — {d}",
-        xaxis_title="timestamp", yaxis_title="|ΔX|",
+        title=f"{chart_title_prefix}Moving Range (MR) — {d}",
+        xaxis_title=x_label, yaxis_title="|ΔX|",
         height=320, hovermode="x unified", legend_title="Series",
     )
     st.plotly_chart(fig_mr, use_container_width=True)
@@ -343,4 +426,4 @@ if refresh_s > 0:
         auto = getattr(st, "autorefresh", None)
         if callable(auto):
             auto(interval=int(refresh_s * 1000), key="spc-autorefresh")
-        # older Streamlit: no-op; user can click Rerun
+        # On older Streamlit with neither available: no-op; click Rerun manually.
