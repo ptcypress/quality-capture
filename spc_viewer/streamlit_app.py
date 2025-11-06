@@ -359,8 +359,8 @@ if source == "Local folder":
                       else r"C:\CaliperCapture\configs"
     cfg_dir_local = st.sidebar.text_input("Config folder (local)", default_cfg_dir)
 
-    @st.cache_data
-    @st.cache_data
+    
+@st.cache_data
 def load_limits_from_yaml_local(cfg_dir: str, part: str):
     """
     Returns (limits_by_dim, source_note).
