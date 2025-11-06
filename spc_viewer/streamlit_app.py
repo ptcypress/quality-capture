@@ -5,8 +5,8 @@
 # • Select multiple DIMs; choose Actual (corrected) vs Raw (caliper)
 # • X-axis toggle: Sequence (even spacing) or Timestamp; optional reset per Reel
 # • I-Chart + MR (MR shown when exactly one DIM is selected)
-# • NEW: Draw USL/LSL from YAML config (per DIM) when plotting Actual values
-# • Auto-locate YAML by part/profile name (e.g., SP-001-25.yml / .yaml)
+# • USL/LSL from YAML config (per DIM) when plotting Actual values
+# • Auto-locate YAML by part/profile (e.g., SP-001-25.yml / .yaml), with override
 # -------------------------------------------------------------
 
 import io
@@ -22,7 +22,7 @@ import streamlit as st
 from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple, List, Dict
 
-# Optional libs (only needed for GitHub mode / Cloud refresh)
+# Optional libs (only needed for GitHub mode / YAML)
 try:
     import requests
 except Exception:
@@ -64,11 +64,16 @@ x_mode = st.sidebar.radio("Plot against", ["Sequence", "Timestamp"], index=0)
 reset_seq_per_reel = st.sidebar.checkbox("Reset sequence per Reel", False)
 
 # ---------------- Helpers ----------------
-def is_numeric_series(s: pd.Series) -> bool:
-    try:
-        return pd.to_numeric(s, errors="coerce").notna().any()
-    except Exception:
-        return False
+def _norm_dim_key(s: str) -> str:
+    """Normalize a feature name to 'DIM N' (DIM1/Dim_1/dim 1 -> DIM 1)."""
+    if not s:
+        return ""
+    t = str(s).strip().upper().replace("_", " ")
+    t = re.sub(r"\s+", " ", t)
+    m = re.match(r"^DIM\s*([0-9]+)$", t)
+    if m:
+        return f"DIM {m.group(1)}"
+    return t
 
 def individuals_limits(series: pd.Series, sigma_mult: float) -> Tuple[float, float, float, float]:
     mr = series.diff().abs()
@@ -279,11 +284,13 @@ else:
 x_field = "seq" if x_mode == "Sequence" else "timestamp"
 x_label = "sequence" if x_field == "seq" else "timestamp"
 
-# Infer part label for chart titles
-part_name = infer_part_label(df, file_label)
+# Infer part label for chart titles, allow override
+part_name_inferred = infer_part_label(df, file_label)
+part_override = st.sidebar.text_input("Override Part/Profile (optional)", value=part_name_inferred).strip().upper()
+part_name = part_override or part_name_inferred
 chart_title_prefix = f"{part_name} — " if part_name else ""
 
-# ---------------- Specs (LSL/USL) ----------------
+# ---------------- Specs (USL/LSL) ----------------
 st.sidebar.header("Specs (USL/LSL)")
 
 if source == "Local folder":
@@ -295,29 +302,24 @@ if source == "Local folder":
 else:
     cfg_dir_local = None
     cfg_repo_dir = st.sidebar.text_input("Config folder in repo", "app_capture/configs").strip()
-    cfg_owner = owner
-    cfg_repo = repo
-    cfg_ref = branch
+    cfg_owner, cfg_repo, cfg_ref = owner, repo, branch
 
 @st.cache_data
 def load_limits_from_yaml_local(cfg_dir: str, part: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-    out = {}
-    if not yaml:
-        return out
-    if not part:
+    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    if not (yaml and part):
         return out
     base = Path(cfg_dir)
-    # try both .yml and .yaml
     for ext in (".yml", ".yaml"):
         p = base / f"{part}{ext}"
         if p.exists():
             try:
-                data = yaml.safe_load(p.read_text(encoding="utf-8"))
+                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
                 feats = data.get("features", [])
                 for f in feats:
                     name = str(f.get("name", "")).strip()
                     if name:
-                        out[name.upper()] = (f.get("lsl", None), f.get("usl", None))
+                        out[_norm_dim_key(name)] = (f.get("lsl", None), f.get("usl", None))
             except Exception:
                 pass
             break
@@ -325,27 +327,26 @@ def load_limits_from_yaml_local(cfg_dir: str, part: str) -> Dict[str, Tuple[Opti
 
 @st.cache_data
 def load_limits_from_yaml_github(owner: str, repo: str, cfg_folder: str, part: str, ref: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-    out = {}
+    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     if not (requests and yaml and part):
         return out
-    # construct raw URL: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{cfg_folder}/{part}.yml
     for ext in (".yml", ".yaml"):
         url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{cfg_folder.strip('/')}/{part}{ext}"
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
             try:
-                data = yaml.safe_load(r.text)
+                data = yaml.safe_load(r.text) or {}
                 feats = data.get("features", [])
                 for f in feats:
                     name = str(f.get("name", "")).strip()
                     if name:
-                        out[name.upper()] = (f.get("lsl", None), f.get("usl", None))
+                        out[_norm_dim_key(name)] = (f.get("lsl", None), f.get("usl", None))
             except Exception:
                 pass
             break
     return out
 
-# Build limits map { "DIM 1": (lsl, usl), ... } (case-insensitive by key)
+# Build limits map { "DIM 1": (lsl, usl), ... } (normalized keys)
 limits_by_dim: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 if part_name:
     if source == "Local folder" and cfg_dir_local:
@@ -353,12 +354,35 @@ if part_name:
     elif source == "GitHub repo" and cfg_repo_dir:
         limits_by_dim = load_limits_from_yaml_github(cfg_owner, cfg_repo, cfg_repo_dir, part_name, cfg_ref)
 
+with st.expander("🔧 Specs Debug", expanded=False):
+    st.write({"inferred_part": part_name_inferred, "effective_part": part_name, "value_mode": value_mode})
+    if source == "Local folder":
+        st.write({"cfg_dir_local": cfg_dir_local, "limits_keys": sorted(list(limits_by_dim.keys()))[:20]})
+        # Optional manual pick from local YAMLs
+        try:
+            cfg_dir = Path(cfg_dir_local)
+            ymls = sorted([p for p in cfg_dir.glob("*.yml")] + [p for p in cfg_dir.glob("*.yaml")])
+            ysel = st.selectbox("Pick YAML (local) to force-load (optional)", ["(auto)"] + [p.name for p in ymls], index=0)
+            if ysel != "(auto)":
+                sel_path = cfg_dir / ysel
+                if yaml:
+                    data = yaml.safe_load(sel_path.read_text(encoding="utf-8")) or {}
+                    feats = data.get("features", [])
+                    limits_by_dim = {_norm_dim_key(f.get("name","")): (f.get("lsl"), f.get("usl")) for f in feats if f.get("name")}
+                    st.success(f"Loaded specs from {sel_path.name}")
+        except Exception as e:
+            st.warning(f"Local YAML pick failed: {e}")
+    else:
+        st.write({"cfg_repo_dir": cfg_repo_dir, "limits_keys": sorted(list(limits_by_dim.keys()))[:20]})
+
 # ---------------- DIM selection ----------------
 # Actual columns are "DIM n"; Raw columns are "_raw_DIM n"
-dim_actual = [c for c in df.columns if c.upper().startswith("DIM ")]
+dim_actual = [c for c in df.columns if _norm_dim_key(c).startswith("DIM ")]
 dims_available: List[str] = []
-for c in sorted(dim_actual, key=lambda s: (int(''.join(ch for ch in s if ch.isdigit()) or 1), s)):
-    dims_available.append(c)
+# Keep original nice names but sort by DIM number
+for c in sorted(dim_actual, key=lambda s: (int(''.join(ch for ch in _norm_dim_key(s) if ch.isdigit()) or 1), s)):
+    if c not in dims_available:
+        dims_available.append(c)
 for c in df.columns:
     if c.startswith("_raw_DIM "):
         base = c.replace("_raw_", "")
@@ -404,18 +428,17 @@ centers, lcls, ucls, sigmas = {}, {}, {}, {}
 for dim in dim_picks:
     y = get_series_for_dim(df, dim, value_mode)
     fig_i.add_trace(go.Scatter(
-        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
-        y=y, mode="lines+markers", name=dim,
+        x=df[x_field], y=y, mode="lines+markers", name=dim,
         hovertemplate=(
             "%{x}<br>"+dim+"=%{y:.5f}<extra></extra>"
-            if x_mode == "Sequence"
+            if x_field == "seq"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>"+dim+"=%{y:.5f}<extra></extra>"
         ),
     ))
     c, lo, hi, s_hat = individuals_limits(y, sigma_mult)
     centers[dim], lcls[dim], ucls[dim], sigmas[dim] = c, lo, hi, s_hat
 
-# Draw per-DIM center/UCL/LCL or grand mean
+# Lines & violations
 if len(dim_picks) == 1:
     d = dim_picks[0]
     fig_i.add_hline(y=centers[d], line_dash="dash", annotation_text=f"{d} Center {centers[d]:.5f}")
@@ -426,12 +449,12 @@ if len(dim_picks) == 1:
     if viol_mask.any():
         v = df.loc[viol_mask]
         fig_i.add_trace(go.Scatter(
-            x=v["seq"] if x_mode == "Sequence" else v["timestamp"],
-            y=y_d[viol_mask], mode="markers", name=f"{d} Violations",
+            x=v[x_field], y=y_d[viol_mask],
+            mode="markers", name=f"{d} Violations",
             marker=dict(size=10, symbol="x"),
             hovertemplate=(
                 "%{x}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
-                if x_mode == "Sequence"
+                if x_field == "seq"
                 else "%{x|%Y-%m-%d %H:%M:%S}<br>"+d+" out-of-control=%{y:.5f}<extra></extra>"
             ),
         ))
@@ -443,7 +466,7 @@ else:
         fig_i.add_hline(y=gm, line_dash="dash", annotation_text=f"Grand mean {gm:.5f}")
     title_suffix = f"{len(dim_picks)} DIMs"
 
-# ---- NEW: Spec lines (USL/LSL) when in Actual mode ----
+# ---- Spec lines (USL/LSL) when in Actual mode ----
 if value_mode.startswith("Actual"):
     spec_lines_drawn = False
     for dim in dim_picks:
@@ -462,11 +485,10 @@ if value_mode.startswith("Actual"):
         st.caption("Specs: no matching LSL/USL found in YAML for selected DIMs.")
 else:
     st.caption("Specs hidden: switch to **Actual (corrected)** to view USL/LSL.")
-    
+
 fig_i.update_layout(
-    title=f"{(infer_part_label(df, file_label) + ' — ') if infer_part_label(df, file_label) else ''}Individuals (I) — {value_mode} — {title_suffix}",
-    xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
-    yaxis_title="Value",
+    title=f"{chart_title_prefix}Individuals (I) — {value_mode} — {title_suffix}",
+    xaxis_title=x_label, yaxis_title="Value",
     height=460, hovermode="x unified", legend_title="Series",
 )
 
@@ -484,11 +506,10 @@ if len(dim_picks) == 1:
 
     fig_mr = go.Figure()
     fig_mr.add_trace(go.Scatter(
-        x=df["seq"] if x_mode == "Sequence" else df["timestamp"],
-        y=mr, mode="lines+markers", name=f"{d} MR(2)",
+        x=df[x_field], y=mr, mode="lines+markers", name=f"{d} MR(2)",
         hovertemplate=(
             "%{x}<br>MR=%{y:.5f}<extra></extra>"
-            if x_mode == "Sequence"
+            if x_field == "seq"
             else "%{x|%Y-%m-%d %H:%M:%S}<br>MR=%{y:.5f}<extra></extra>"
         ),
     ))
@@ -496,9 +517,8 @@ if len(dim_picks) == 1:
     fig_mr.add_hline(y=MR_UCL, line_dash="dot",  annotation_text=f"{d} UCL {MR_UCL:.5f}")
     fig_mr.add_hline(y=MR_LCL, line_dash="dot",  annotation_text=f"{d} LCL {MR_LCL:.5f}")
     fig_mr.update_layout(
-        title=f"{infer_part_label(df, file_label)+' — ' if infer_part_label(df, file_label) else ''}Moving Range (MR) — {d}",
-        xaxis_title=("sequence" if x_mode == "Sequence" else "timestamp"),
-        yaxis_title="|ΔX|",
+        title=f"{chart_title_prefix}Moving Range (MR) — {d}",
+        xaxis_title=x_label, yaxis_title="|ΔX|",
         height=320, hovermode="x unified", legend_title="Series",
     )
     st.plotly_chart(fig_mr, use_container_width=True)
